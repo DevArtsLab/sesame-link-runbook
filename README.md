@@ -46,11 +46,22 @@ set to launch at login.
 State lives in `~/.local/state/sesame-link/`:
 
 ```
-auth/production.json      sign-in credential (30-day validity)
-remote-access.json        what remote clients may do (see below)
-daemon.log                service log (sesame-link logs)
-daemon.lock               lifecycle lock
-machine/credential        machine credential used for the gateway channel
+auth/production.json            sign-in credential (30-day validity)
+remote-access.json              what remote clients may do (see below)
+daemon.log                      service log (sesame-link logs)
+daemon.lock                     lifecycle lock
+machine/credential              machine credential used for the gateway channel
+api.sock, api-token             local IPC socket + token for CLI <-> daemon
+sessions/, ended-sessions/      live and ended session records
+idempotency/                    dedupe keys for remote requests
+daemon-intent.json              desired running/stopped state
+daemon-launch.json              options the daemon was started with
+daemon-launch-limits-current    launch limits in effect
+daemon-lifecycle.lock           start/stop serialization
+daemon-service-ready            readiness marker
+management-environment          resolved service environment
+recent-working-directories.json recent session working dirs
+session-host.command            helper for session hosting
 ```
 
 ## Architecture
@@ -68,6 +79,54 @@ sesame-link daemon -> tmux -> claude / codex / pi / cursor
 The daemon holds one outbound websocket to
 `wss://sesame-link-session-service.fly.dev/v1/gateway/machine`. All remote
 control rides that channel; nothing listens on the LAN.
+
+In more detail, on this machine:
+
+```
+link.sesame.com (browser / phone)
+        |  HTTPS + WSS
+        v
+sesame-link-session-service.fly.dev   auth API + wss gateway relay
+        |  one outbound websocket: /v1/gateway/machine
+        v
+sesame-link daemon (Rust, launchd, ~/.local/bin/sesame-link)
+   |-- gateway ws channel, session lifecycle, launch at login
+   |-- local IPC: api.sock + api-token
+   |-- state: ~/.local/state/sesame-link/ (0700)
+   |        auth/production.json  machine/credential  remote-access.json
+   |-- spawns / attaches tmux -> runtime sessions
+   |        claude (Claude Code)  codex  pi  cursor
+   +-- local tools: gh CLI -> GitHub PRs; runtime executables on PATH
+```
+
+Versions drift constantly; `sesame-link status` shows the current daemon,
+runtime, and tmux versions.
+
+### Flows
+
+```
+REMOTE PATH   phone/browser -> session service -> gateway ws -> daemon
+              -> tmux -> runtime        (keystrokes in, terminal out)
+
+LOCAL PATH    terminal -> `sesame-link claude` or `sessions` -> tmux attach
+              (bypasses the cloud entirely)
+
+HANDOFF PATH  inside Claude Code: /open-sesame
+              -> local conversation moves into a Link-hosted tmux session
+              -> becomes reachable from link.sesame.com
+
+PR PATH       session work -> local `gh` -> GitHub PRs surfaced in web app
+              (only when `pull-requests` config toggle is on)
+```
+
+### Trust boundaries
+
+| Boundary           | Control                                                       |
+| ------------------ | ------------------------------------------------------------- |
+| remote -> machine  | `remote-access.json` allowlists (see Security posture)        |
+| machine -> service | outbound-only WSS; `machine/credential` + 30-day sign-in      |
+| revocation         | `sesame-link unpair`; sign-in expires in 30 days              |
+| TLS inspection     | embedded webpki roots; needs Do-Not-Inspect rules (see below) |
 
 ## TLS inspection (the one real gotcha)
 
@@ -109,13 +168,22 @@ for Python in `../sesame-voice-escort` (fixed there with a merged CA bundle).
 `remote-access.json` in the state directory defines what remote clients may
 do on this machine. Defaults observed on this install:
 
-| Setting | Meaning |
-|---|---|
-| `allow_remote_bash_commands: false` | browsers cannot run arbitrary shell |
-| `allow_claude_persistent_directories/rules: false` | sessions cannot permanently widen their own scope |
-| `allowed_permission_modes` | `manual`, `acceptEdits`, `plan`, `auto`, `dontAsk` are all permitted |
-| `allowed_codex_sandbox_policies` | `read_only`, `workspace_write` |
-| `allowed_remote_slash_commands` | `compact`, `clear`, `context`, `reload-skills` |
+| Setting                                            | Meaning                                                              |
+| -------------------------------------------------- | -------------------------------------------------------------------- |
+| `allow_remote_bash_commands: false`                | browsers cannot run arbitrary shell                                  |
+| `allow_claude_persistent_directories/rules: false` | sessions cannot permanently widen their own scope                    |
+| `allowed_permission_modes`                         | `manual`, `acceptEdits`, `plan`, `auto`, `dontAsk` are all permitted |
+| `allowed_remote_runtimes`                          | `claude_code`, `codex`, `pi`, `cursor`                               |
+| `allowed_remote_slash_commands`                    | `compact`, `clear`, `context`, `reload-skills`                       |
+| `allowed_codex_sandbox_policies`                   | `read_only`, `workspace_write`                                       |
+| `allowed_codex_approval_policies`                  | `untrusted`, `on_request`                                            |
+| `allowed_codex_approval_reviewers`                 | `user`, `auto_review`                                                |
+| `allow_codex_execpolicy_amendments: false`         | sessions cannot widen Codex exec policy                              |
+| `allow_codex_network_policy_amendments: false`     | sessions cannot widen Codex network policy                           |
+| `allow_codex_persistent_approvals: false`          | Codex approvals do not persist                                       |
+| `allowed_codex_filesystem_roots`                   | empty: no extra filesystem roots                                     |
+| `allowed_codex_network_destinations`               | empty: no extra network destinations                                 |
+| `allowed_cursor_approval_modes`                    | `allowlist`, `auto_review`                                           |
 
 Runtime toggles via `sesame-link config <setting> on|off`:
 `claude-mod`, `error-reporting`, `remote-update`, `thinking`,
@@ -133,25 +201,26 @@ Hardening suggestions:
 
 ## Command reference
 
-| Command | Purpose |
-|---|---|
-| `sesame-link auth login` | sign in, add this machine (prints a code to verify in the browser) |
-| `sesame-link status [--verbose]` | daemon, connection, runtimes, version |
-| `sesame-link start / stop / restart` | daemon lifecycle |
-| `sesame-link serve` | run in the foreground (debugging) |
-| `sesame-link logs` | tail the daemon log |
-| `sesame-link sessions` | list, attach, create, delete sessions |
-| `sesame-link claude` (also `codex`, `pi`, `cursor`) | start a runtime session in this folder |
-| `sesame-link open-sesame` | move the enclosing Claude Code conversation into a Link session |
-| `sesame-link install-claude-command` | installs `/open-sesame` for Claude Code |
-| `sesame-link connect` | link a browser or another client |
-| `sesame-link machine` | manage this machine and others on the account |
-| `sesame-link unpair` | remove this machine from the account |
-| `sesame-link doctor` | check and repair the installation |
-| `sesame-link diagnostics` | bundle logs/state into an archive for support |
-| `sesame-link update` | self-update the binary |
-| `sesame-link config` | view/change settings toggles |
-| `sesame-link uninstall` | stop, unpair, remove |
+| Command                                             | Purpose                                                            |
+| --------------------------------------------------- | ------------------------------------------------------------------ |
+| `sesame-link auth login`                            | sign in, add this machine (prints a code to verify in the browser) |
+| `sesame-link status [--verbose]`                    | daemon, connection, runtimes, version                              |
+| `sesame-link start / stop / restart`                | daemon lifecycle                                                   |
+| `sesame-link serve`                                 | run in the foreground (debugging)                                  |
+| `sesame-link logs`                                  | tail the daemon log                                                |
+| `sesame-link sessions`                              | list, attach, create, delete sessions                              |
+| `sesame-link claude` (also `codex`, `pi`, `cursor`) | start a runtime session in this folder                             |
+| `sesame-link open-sesame`                           | move the enclosing Claude Code conversation into a Link session    |
+| `sesame-link install-claude-command`                | installs `/open-sesame` for Claude Code                            |
+| `sesame-link connect`                               | link a browser or another client                                   |
+| `sesame-link machine`                               | manage this machine and others on the account                      |
+| `sesame-link unpair`                                | remove this machine from the account                               |
+| `sesame-link doctor`                                | check and repair the installation                                  |
+| `sesame-link diagnostics`                           | bundle logs/state into an archive for support                      |
+| `sesame-link setup`                                 | check this machine's setup and offer to install `/open-sesame`     |
+| `sesame-link update`                                | self-update the binary                                             |
+| `sesame-link config`                                | view/change settings toggles                                       |
+| `sesame-link uninstall`                             | stop, unpair, remove                                               |
 
 ## Daily workflows
 
@@ -167,14 +236,14 @@ Hardening suggestions:
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| "Couldn't reach Sesame" on `auth login` | TLS inspection vs embedded webpki roots | Do-Not-Inspect rule (see above); verify issuer with `openssl s_client` |
-| `status` says "running but not answering" | stale daemon | `sesame-link restart`; check `logs` |
-| "tmux isn't installed" | daemon started with a different PATH than the login shell | install tmux, then `sesame-link restart` so the tmux server re-inherits PATH |
-| Runtime shows `unavailable` | missing executable | install `claude`/`codex`/etc., or pass an explicit executable flag |
-| Login lock errors | stale `auth/login.lock` | remove the lock file and retry |
-| Web app can't see sessions | remote access off or machine revoked | `remote-access.json` -> `remote_access_enabled`, else `auth login` again |
+| Symptom                                   | Likely cause                                              | Fix                                                                          |
+| ----------------------------------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| "Couldn't reach Sesame" on `auth login`   | TLS inspection vs embedded webpki roots                   | Do-Not-Inspect rule (see above); verify issuer with `openssl s_client`       |
+| `status` says "running but not answering" | stale daemon                                              | `sesame-link restart`; check `logs`                                          |
+| "tmux isn't installed"                    | daemon started with a different PATH than the login shell | install tmux, then `sesame-link restart` so the tmux server re-inherits PATH |
+| Runtime shows `unavailable`               | missing executable                                        | install `claude`/`codex`/etc., or pass an explicit executable flag           |
+| Login lock errors                         | stale `auth/login.lock`                                   | remove the lock file and retry                                               |
+| Web app can't see sessions                | remote access off or machine revoked                      | `remote-access.json` -> `remote_access_enabled`, else `auth login` again     |
 
 `sesame-link diagnostics` produces the bundle to send when asking for help.
 
