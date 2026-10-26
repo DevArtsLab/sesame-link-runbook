@@ -70,6 +70,7 @@ if (sessionDir) {
   } catch {}
 }
 const sessionFile = path.join(sessionDir || adapterDir, "devin-session.jsonl");
+const stateFile = path.join(sessionDir || adapterDir, "devin-session-state.json");
 const ledgerFile = path.join(adapterDir, "attempts.jsonl");
 
 const say = (...args) => console.log("[bridge]", ...args);
@@ -151,6 +152,52 @@ const session = {
   thinking: "off",
   entries: [],
   leafId: null,
+  devinSessionId: null, // ACP session id; survives bridge respawns via sidecar
+  // Restore a previous bridge process's session: the daemon holds sessionId
+  // and replays `history` after respawn, so both must survive this process.
+  load() {
+    try {
+      const meta = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      if (meta.name) this.name = meta.name;
+      if (meta.model?.id) this.model = meta.model;
+      if (meta.thinking) this.thinking = meta.thinking;
+      this.devinSessionId = meta.devinSessionId ?? null;
+    } catch {}
+    let restored = false;
+    try {
+      const lines = fs
+        .readFileSync(sessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+      for (const line of lines) {
+        try {
+          const rec = JSON.parse(line);
+          if (rec.type === "session" && typeof rec.id === "string") {
+            this.id = rec.id;
+            restored = true;
+          } else if (rec.type === "message" && rec.id && rec.message) {
+            this.entries.push(rec);
+            this.leafId = rec.id;
+          }
+        } catch {}
+      }
+    } catch {}
+    return restored;
+  },
+  saveMeta() {
+    try {
+      fs.writeFileSync(
+        stateFile,
+        JSON.stringify({
+          name: this.name,
+          model: this.model,
+          thinking: this.thinking,
+          devinSessionId: devin.sessionId,
+        }),
+      );
+    } catch {}
+  },
   writeHeader() {
     fs.appendFileSync(
       sessionFile,
@@ -229,6 +276,7 @@ const devin = {
   running: false, // a session/prompt is in flight
   queue: [], // followUp prompts while running
   currentOp: null, // { operationId, runId, text, assistantText }
+  injectedOp: null, // steered op whose prompt is in flight behind the current turn
   runId: null,
   tools: new Set(),
 
@@ -288,7 +336,7 @@ const devin = {
       this.child = null;
       this.sessionId = null;
       if (wasRunning && this.currentOp)
-        this.finishRun("failed", "Devin agent exited mid-run");
+        this.finishOp(this.currentOp, "failed", "Devin agent exited mid-run");
     });
     const init = await this.call("initialize", {
       protocolVersion: 1,
@@ -307,15 +355,34 @@ const devin = {
     // Forward a Link-provided MCP config when the daemon writes one; fall back
     // to none if the ACP server refuses stdio MCP specs.
     const mcpServers = readMcpServers(path.join(adapterDir, "mcp.json"));
-    let created;
-    try {
-      created = await this.call("session/new", { cwd: session.cwd, mcpServers });
-    } catch (error) {
-      say("session/new with mcp failed, retrying without:", error.message);
-      created = await this.call("session/new", { cwd: session.cwd, mcpServers: [] });
+    // A respawned bridge re-attaches the same ACP session (devin keeps its
+    // context server-side); only when that fails does a fresh session start.
+    if (session.devinSessionId) {
+      try {
+        await this.call("session/load", {
+          sessionId: session.devinSessionId,
+          cwd: session.cwd,
+          mcpServers,
+        });
+        this.sessionId = session.devinSessionId;
+        say("acp session resumed", this.sessionId);
+      } catch (error) {
+        say("session/load failed, starting fresh:", error.message);
+      }
     }
-    this.sessionId = created.sessionId;
-    say("acp session", this.sessionId);
+    if (!this.sessionId) {
+      let created;
+      try {
+        created = await this.call("session/new", { cwd: session.cwd, mcpServers });
+      } catch (error) {
+        say("session/new with mcp failed, retrying without:", error.message);
+        created = await this.call("session/new", { cwd: session.cwd, mcpServers: [] });
+      }
+      this.sessionId = created.sessionId;
+      say("acp session", this.sessionId);
+    }
+    session.devinSessionId = this.sessionId;
+    session.saveMeta();
     emit({ type: "session", state: state() });
   },
 
@@ -386,16 +453,81 @@ const devin = {
   async submit(operationId, text, images, mode) {
     const op = { operationId, runId: randomUUID(), text, images, assistantText: "" };
     if (this.queue.length >= 64) throw new Error("Prompt queue full");
-    if (this.running && mode === "followUp") {
-      this.queue.push(op);
-      return op;
-    }
     if (this.running && mode === "steer") {
-      this.notify("session/cancel", { sessionId: this.sessionId });
+      // True steer: send the prompt while the turn is still running. If devin
+      // queues it as the next turn the context is preserved without a cancel;
+      // if it rejects a concurrent prompt we fall back to cancel + enqueue.
+      this.injectSteer(op);
+      return op;
     }
     this.queue.push(op);
     this.pump();
     return op;
+  },
+
+  injectSteer(op) {
+    this.injectedOp = op;
+    this.admit(op);
+    this.call("session/prompt", {
+      sessionId: this.sessionId,
+      prompt: this.buildPrompt(op),
+    }).then(
+      (result) =>
+        this.finishOp(
+          op,
+          result?.stopReason === "cancelled" ? "interrupted" : "completed",
+          null,
+          result?.stopReason,
+        ),
+      (error) => this.steerRejected(op, error),
+    );
+  },
+
+  steerRejected(op, error) {
+    say("steer injection rejected, cancelling instead:", error.message ?? error);
+    if (this.injectedOp === op) this.injectedOp = null;
+    // The op's user entry is already admitted to history; requeue it so it
+    // runs as a plain prompt once the cancelled turn unwinds (old behavior).
+    this.notify("session/cancel", { sessionId: this.sessionId });
+    this.queue.push(op);
+  },
+
+  // Write the user's side of a prompt into history + emit its events. Runs
+  // once per op; steered ops are admitted before their turn starts.
+  admit(op) {
+    if (op.admitted) return;
+    op.admitted = true;
+    const entry = session.appendMessage("user", op.text);
+    emit({ type: "input", text: op.text, source: "extension" });
+    emit({
+      type: "message_end",
+      message: { role: "user", content: [{ type: "text", text: op.text }] },
+    });
+    this.deliver(op.operationId, entry.id);
+  },
+
+  buildPrompt(op) {
+    const prompt = [{ type: "text", text: op.text }];
+    // The daemon's remote-operation guidance goes in once, like Pi's
+    // --append-system-prompt, as an embedded resource on the first prompt.
+    if (!this.guidanceSent) {
+      const guidance = readGuidance();
+      if (guidance) {
+        prompt.unshift({
+          type: "resource",
+          resource: {
+            uri: `file://${guidanceFile}`,
+            mimeType: "text/plain",
+            text: guidance,
+          },
+        });
+      }
+      this.guidanceSent = true;
+    }
+    for (const image of op.images ?? []) {
+      prompt.push({ type: "image", data: image.data, mimeType: image.mimeType });
+    }
+    return prompt;
   },
 
   async pump() {
@@ -405,48 +537,23 @@ const devin = {
     this.runId = op.runId;
     this.running = true;
 
-    const entry = session.appendMessage("user", op.text);
-    emit({ type: "input", text: op.text, source: "extension" });
-    emit({
-      type: "message_end",
-      message: { role: "user", content: [{ type: "text", text: op.text }] },
-    });
-    this.deliver(op.operationId, entry.id);
+    this.admit(op);
     emit({ type: "before_agent_start" });
     emit({ type: "agent_start" });
 
     try {
-      const prompt = [{ type: "text", text: op.text }];
-      // The daemon's remote-operation guidance goes in once, like Pi's
-      // --append-system-prompt, as an embedded resource on the first prompt.
-      if (!this.guidanceSent) {
-        const guidance = readGuidance();
-        if (guidance) {
-          prompt.unshift({
-            type: "resource",
-            resource: {
-              uri: `file://${guidanceFile}`,
-              mimeType: "text/plain",
-              text: guidance,
-            },
-          });
-        }
-        this.guidanceSent = true;
-      }
-      for (const image of op.images ?? []) {
-        prompt.push({ type: "image", data: image.data, mimeType: image.mimeType });
-      }
       const result = await this.call("session/prompt", {
         sessionId: this.sessionId,
-        prompt,
+        prompt: this.buildPrompt(op),
       });
-      this.finishRun(
+      this.finishOp(
+        op,
         result?.stopReason === "cancelled" ? "interrupted" : "completed",
         null,
         result?.stopReason,
       );
     } catch (error) {
-      this.finishRun("failed", String(error.message ?? error));
+      this.finishOp(op, "failed", String(error.message ?? error));
     }
   },
 
@@ -494,13 +601,23 @@ const devin = {
     emit({ type: "command_delivered", operationId, entryId });
   },
 
-  finishRun(outcome, error, stopReason = "end_turn") {
-    const op = this.currentOp;
-    this.running = false;
-    this.runId = null;
-    this.currentOp = null;
-    this.tools.clear();
+  finishOp(op, outcome, error, stopReason = "end_turn") {
     if (!op) return;
+    if (this.injectedOp === op) this.injectedOp = null;
+    if (this.currentOp === op) {
+      // A steered prompt queued behind this turn takes over: its chunks now
+      // belong to it and abort targets it.
+      this.currentOp = this.injectedOp ?? null;
+      this.runId = this.currentOp?.runId ?? null;
+      if (this.currentOp) {
+        this.injectedOp = null;
+        emit({ type: "before_agent_start" });
+        emit({ type: "agent_start" });
+      } else {
+        this.tools.clear();
+      }
+    }
+    this.running = !!this.currentOp;
     const entry = session.appendMessage(
       "assistant",
       op.assistantText || (error ? `Error: ${error}` : ""),
@@ -818,6 +935,7 @@ function mutate(request, command, receipt, images) {
     devin.cancel(command.runId);
   } else if (command.type === "rename") {
     session.name = command.name;
+    session.saveMeta();
     emit({ type: "session_info_changed", state: state() });
   } else if (command.type === "configure") {
     if (command.model) {
@@ -841,10 +959,12 @@ function mutate(request, command, receipt, images) {
           })
           .catch((error) => say("model configure ignored:", error.message));
       }
+      session.saveMeta();
       emit({ type: "model_select", state: state() });
     }
     if (command.thinking !== undefined) {
       session.thinking = command.thinking;
+      session.saveMeta();
       emit({ type: "thinking_level_select", state: state() });
     }
   } else if (command.type === "compact") {
@@ -892,7 +1012,11 @@ function clearStaleSocket(cb) {
 
 function main() {
   ledger.open();
-  session.writeHeader();
+  if (session.load()) {
+    say(`restored session ${session.id}: ${session.entries.length} entries`);
+  } else {
+    session.writeHeader();
+  }
 
   clearStaleSocket(() => {
     const server = net.createServer((peer) => {
