@@ -288,12 +288,21 @@ Runtime toggles via `sesame-link config <setting> on|off`:
 
 Bridge-specific posture:
 
-- `allow_remote_bash_commands` gates sesame-link's own remote bash tool, not
-  Devin's tools. In a Pi (bridge) session, Devin decides what it runs, and
-  `session/request_permission` is auto-answered per `BRIDGE_PERMISSION_PICK`
-  (default `allow_once`). Treat any Pi session as shell access on this Mac.
+- **A Pi session is shell access on the host.** `allow_remote_bash_commands`
+  gates sesame-link's own remote bash tool, not Devin's. In a bridge
+  session, Devin decides what it runs and `session/request_permission` is
+  auto-answered per `BRIDGE_PERMISSION_PICK` (default `allow_once`). Anyone
+  who can reach a Pi session can execute commands with your account's
+  permissions. If you publish or share this setup, say this plainly.
+- `BRIDGE_PERMISSION_PICK=reject_once` turns a Pi session read-only: it can
+  answer questions but every tool call is denied. Use it when a session
+  should never mutate the machine.
 - Devin bills usage to the signed-in account, unlike the Claude subscription
   path.
+- There is no sandbox. A dedicated working directory is hygiene, not
+  isolation: the bridge can still reach anything your user account can. Real
+  isolation means running the whole sesame-link + devin stack in a container
+  (Docker/OrbStack) or a separate OS user; nothing in the bridge enforces it.
 
 Hardening suggestions:
 
@@ -301,8 +310,8 @@ Hardening suggestions:
   unattended sessions; `manual`/`plan`/`acceptEdits` keeps remote approval in
   the loop.
 - Keep `allow_remote_bash_commands` off; it is the highest-blast-radius switch.
-- Consider `BRIDGE_PERMISSION_PICK=reject_once` if a Pi session should only
-  answer questions, or run bridge sessions in a throwaway folder.
+- For unattended or shared machines, run bridge sessions in a container or a
+  dedicated OS user rather than relying on `BRIDGE_PERMISSION_PICK` alone.
 - The sign-in is valid 30 days and the machine credential rotates
   independently; `sesame-link unpair` revokes the machine entirely.
 - The state directory is owner-only (`0700`); keep it that way.

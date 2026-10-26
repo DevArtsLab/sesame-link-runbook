@@ -29,7 +29,9 @@ session on link.sesame.com misbehaves.
 - `devin acp` boots all configured MCP servers at spawn; first submit is slow.
 - Permission prompts are auto-answered by `BRIDGE_PERMISSION_PICK` (default
   `allow_once`); `DEVIN_BIN`, `DEVIN_CREDENTIALS`, `NODE_BIN`,
-  `BRIDGE_SCRIPT` env vars override defaults.
+  `BRIDGE_SCRIPT` env vars override defaults. A Pi session is shell access on
+  the host; there is no sandbox — real isolation means a container or
+  separate OS user.
 - The daemon writes per-session files in the adapter dir: `extension.ts`,
   `adapter.mjs` (its own Pi adapter, unused by us), `mcp.json`,
   `remote-guidance.txt`, `mcp-capability`. The bridge consumes mcp.json and
