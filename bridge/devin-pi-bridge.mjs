@@ -364,11 +364,23 @@ const devin = {
       say("permission auto-answered:", pick?.name ?? pick?.optionId ?? "none");
       return;
     }
-    respond(undefined); // unsupported requests get an empty result
+    // Unsupported agent->client requests get a proper JSON-RPC error, not an
+    // empty result (a missing result/error member is a malformed response and
+    // can leave the ACP server waiting on a reply that never parses).
+    try {
+      this.child?.stdin.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32601, message: `Not implemented: ${msg.method}` },
+        }) + "\n",
+      );
+    } catch {}
   },
 
   async submit(operationId, text, images, mode) {
     const op = { operationId, runId: randomUUID(), text, images, assistantText: "" };
+    if (this.queue.length >= 64) throw new Error("Prompt queue full");
     if (this.running && mode === "followUp") {
       this.queue.push(op);
       return op;
@@ -608,30 +620,38 @@ function readImages(paths) {
   return paths.map((p) => {
     if (typeof p !== "string" || !p.startsWith("/"))
       throw new Error("Invalid image path");
-    const data = fs.readFileSync(p);
-    const mimeType = data
-      .subarray(0, 8)
-      .equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
-      ? "image/png"
-      : data[0] === 255 && data[1] === 216
-        ? "image/jpeg"
-        : undefined;
-    if (!mimeType) throw new Error("Unsupported image");
-    return { type: "image", mimeType, data: data.toString("base64") };
+    const fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.size > 8 * 1024 * 1024 || (stat.mode & 0o077) !== 0)
+        throw new Error("Invalid image file");
+      const data = fs.readFileSync(fd);
+      const mimeType = data
+        .subarray(0, 8)
+        .equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+        ? "image/png"
+        : data[0] === 255 && data[1] === 216
+          ? "image/jpeg"
+          : undefined;
+      if (!mimeType) throw new Error("Unsupported image");
+      return { type: "image", mimeType, data: data.toString("base64") };
+    } finally {
+      fs.closeSync(fd);
+    }
   });
 }
 
 function history(request) {
-  let start = 0;
-  if (
-    request.leafId &&
-    request.leafId !== session.leafId &&
-    !session.entries.some((e) => e.id === request.leafId)
-  ) {
-    throw new Error("Unknown history leaf");
+  // The requested leaf bounds the branch's end; `after` bounds its start.
+  let branch = session.entries;
+  if (request.leafId) {
+    const leafIndex = session.entries.findIndex((e) => e.id === request.leafId);
+    if (leafIndex === -1) throw new Error("Unknown history leaf");
+    branch = session.entries.slice(0, leafIndex + 1);
   }
+  let start = 0;
   if (request.after) {
-    start = session.entries.findIndex((e) => e.id === request.after) + 1;
+    start = branch.findIndex((e) => e.id === request.after) + 1;
     if (start === 0) throw new Error("History cursor is not on this branch");
   }
   const limit = request.limit ?? 50;
@@ -639,7 +659,7 @@ function history(request) {
     throw new Error("Invalid history limit");
   const entries = [];
   let bytes = 0;
-  for (const entry of session.entries.slice(start)) {
+  for (const entry of branch.slice(start)) {
     const size = Buffer.byteLength(JSON.stringify(entry));
     if (bytes + size > FRAME_BYTES * 0.7) break;
     entries.push(entry);
@@ -651,7 +671,7 @@ function history(request) {
     leafId: session.leafId,
     entries,
     next: entries.at(-1)?.id ?? request.after ?? null,
-    complete: start + entries.length === session.entries.length,
+    complete: start + entries.length === branch.length,
     operationCorrelation: "unavailable",
   };
 }
@@ -763,6 +783,17 @@ async function handleRequest(request) {
   const receipt = ledger.claim(request.operationId, command);
   emit({ type: "command_attempted", operation: receipt.record });
 
+  // Once claimed, a failure below leaves dispatch unknowable; the daemon can
+  // only recover the outcome from the journal, not from "not attempted".
+  try {
+    return mutate(request, command, receipt, images);
+  } catch (error) {
+    error.dispatch = "unknown";
+    throw error;
+  }
+}
+
+function mutate(request, command, receipt, images) {
   if (command.type === "submit") {
     // Fire-and-forget: the prompt runs asynchronously; events broadcast progress.
     devin
@@ -785,14 +816,26 @@ async function handleRequest(request) {
     emit({ type: "session_info_changed", state: state() });
   } else if (command.type === "configure") {
     if (command.model) {
-      const model = MODELS.find(
-        (m) =>
-          m.id === command.model.id &&
-          (command.model.provider === undefined ||
-            m.provider === command.model.provider),
-      );
-      if (!model) throw new Error("Model unavailable");
-      session.model = model;
+      if (typeof command.model.id !== "string" || !command.model.id)
+        throw new Error("Invalid model");
+      // The Pi catalog is unavailable, so the app sends model names as free
+      // text. Accept anything and best-effort forward it to the agent.
+      const known = MODELS.find((m) => m.id === command.model.id);
+      session.model = known ?? {
+        provider: command.model.provider ?? "devin",
+        id: command.model.id,
+        name: command.model.id,
+        input: ["text", "image"],
+      };
+      if (!known && devin.sessionId) {
+        devin
+          .call("session/set_config_option", {
+            sessionId: devin.sessionId,
+            configId: "model",
+            value: command.model.id,
+          })
+          .catch((error) => say("model configure ignored:", error.message));
+      }
       emit({ type: "model_select", state: state() });
     }
     if (command.thinking !== undefined) {
@@ -801,20 +844,20 @@ async function handleRequest(request) {
     }
   } else if (command.type === "compact") {
     // Devin manages its own context; nothing to compact remotely.
+    try {
+      ledger.record(request.operationId, { completion: "completed" });
+    } catch {}
     emit({ type: "session_compact", state: state() });
     emit({
       type: "command_completed",
       operationId: request.operationId,
       outcome: "completed",
     });
-    try {
-      ledger.record(request.operationId, { completion: "completed" });
-    } catch {}
   } else if (command.type === "reload") {
-    emit({ type: "command_completed", operationId: request.operationId });
     try {
       ledger.record(request.operationId, { completion: "completed" });
     } catch {}
+    emit({ type: "command_completed", operationId: request.operationId });
   }
   return { ...receipt, state: state() };
 }
@@ -822,99 +865,126 @@ async function handleRequest(request) {
 // ---------------------------------------------------------------------------
 // Transport: unix-socket JSON-lines server, same envelope as Pi's adapter.
 // ---------------------------------------------------------------------------
+// Only remove a stale socket: one that exists but refuses a connection. A
+// socket that answers could belong to a healthy bridge, like Pi's adapter.
+function clearStaleSocket(cb) {
+  fs.access(socketPath, fs.constants.F_OK, (err) => {
+    if (err) return cb();
+    const probe = net.createConnection(socketPath);
+    probe.once("connect", () => {
+      probe.end();
+      say(`socket ${socketPath} already has a live listener; exiting`);
+      process.exit(1);
+    });
+    probe.once("error", () => {
+      try {
+        fs.unlinkSync(socketPath);
+      } catch {}
+      cb();
+    });
+  });
+}
+
 function main() {
   ledger.open();
   session.writeHeader();
 
-  try {
-    fs.unlinkSync(socketPath);
-  } catch {}
-  const server = net.createServer((peer) => {
-    if (peers.size >= 4) {
-      peer.destroy();
-      return;
-    }
-    peers.add(peer);
-    peer.on("error", () => {});
-    peer.on("close", () => peers.delete(peer));
-    peer.setEncoding("utf8");
-    let buffer = "";
-    let inFlight = 0;
-    peer.on("data", (chunk) => {
-      buffer += chunk;
-      if (Buffer.byteLength(buffer) > FRAME_BYTES) {
+  clearStaleSocket(() => {
+    const server = net.createServer((peer) => {
+      if (peers.size >= 4) {
         peer.destroy();
         return;
       }
-      let end;
-      while ((end = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, end);
-        buffer = buffer.slice(end + 1);
-        if (++inFlight > 16) {
+      peers.add(peer);
+      peer.on("error", () => {});
+      peer.on("close", () => peers.delete(peer));
+      peer.setEncoding("utf8");
+      let buffer = "";
+      let inFlight = 0;
+      peer.on("data", (chunk) => {
+        buffer += chunk;
+        if (Buffer.byteLength(buffer) > FRAME_BYTES) {
           peer.destroy();
           return;
         }
-        let request;
-        try {
-          request = JSON.parse(line);
-          if (
-            !request ||
-            Array.isArray(request) ||
-            typeof request !== "object" ||
-            typeof request.id !== "string" ||
-            !TOKEN.test(request.id)
-          ) {
-            throw new Error("Invalid request envelope");
+        let end;
+        while ((end = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, end);
+          buffer = buffer.slice(end + 1);
+          if (++inFlight > 16) {
+            peer.destroy();
+            return;
           }
-        } catch {
-          peer.destroy();
-          return;
+          let request;
+          try {
+            request = JSON.parse(line);
+            if (
+              !request ||
+              Array.isArray(request) ||
+              typeof request !== "object" ||
+              typeof request.id !== "string" ||
+              !TOKEN.test(request.id)
+            ) {
+              throw new Error("Invalid request envelope");
+            }
+          } catch {
+            peer.destroy();
+            return;
+          }
+          Promise.resolve()
+            .then(() => handleRequest(request))
+            .then(
+              (result) =>
+                send(peer, { type: "response", id: request.id, ok: true, result }),
+              (error) =>
+                send(peer, {
+                  type: "response",
+                  id: request.id,
+                  ok: false,
+                  error: String(error.message ?? error),
+                  dispatch: error.dispatch ?? "not_attempted",
+                }),
+            )
+            .finally(() => {
+              inFlight--;
+            });
         }
-        Promise.resolve()
-          .then(() => handleRequest(request))
-          .then(
-            (result) =>
-              send(peer, { type: "response", id: request.id, ok: true, result }),
-            (error) =>
-              send(peer, {
-                type: "response",
-                id: request.id,
-                ok: false,
-                error: String(error.message ?? error),
-                dispatch: "not_attempted",
-              }),
-          )
-          .finally(() => {
-            inFlight--;
-          });
-      }
+      });
     });
-  });
-  server.listen(socketPath, () => {
-    try {
-      fs.chmodSync(socketPath, 0o600);
-    } catch {}
-    say(`ready: ${socketPath}`);
-    say(`session ${session.id} in ${session.cwd}`);
-    emit({ type: "session", state: state() });
-  });
-  server.on("error", (error) => {
-    say("socket error:", error.message);
-    process.exit(1);
+    server.listen(socketPath, () => {
+      try {
+        fs.chmodSync(socketPath, 0o600);
+      } catch {}
+      say(`ready: ${socketPath}`);
+      say(`session ${session.id} in ${session.cwd}`);
+      emit({ type: "session", state: state() });
+    });
+    server.on("error", (error) => {
+      say("socket error:", error.message);
+      process.exit(1);
+    });
+
+    const shutdown = () => {
+      say("shutting down");
+      for (const peer of peers) peer.destroy();
+      server.close();
+      try {
+        devin.child?.kill("SIGTERM");
+      } catch {}
+      ledger.close();
+      process.exit(0);
+    };
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
   });
 
-  const shutdown = () => {
-    say("shutting down");
-    for (const peer of peers) peer.destroy();
-    server.close();
+  // Node does not kill spawned children on exit: leave no orphaned `devin acp`
+  // (and its MCP children) behind when this process dies abruptly.
+  process.on("exit", () => {
     try {
       devin.child?.kill("SIGTERM");
     } catch {}
-    ledger.close();
-    process.exit(0);
-  };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  });
   process.on("uncaughtException", (error) => say("uncaught:", error.stack ?? error));
   process.on("unhandledRejection", (error) =>
     say("unhandled rejection:", error?.stack ?? error),

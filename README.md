@@ -4,6 +4,10 @@ Working notes and runbook for [Sesame Link](https://link.sesame.com): the
 companion that runs coding sessions on a local machine and makes them
 reachable from the Sesame web app on any device.
 
+This repo also hosts `bridge/devin-pi-bridge.mjs`: the adapter that puts
+Devin Local behind Sesame Link's "Pi" runtime slot. See
+[The Devin bridge](#the-devin-bridge-pi-slot).
+
 This is unrelated to Sesame Voice Capture (see `../sesame-voice-escort`).
 Voice Capture moves audio in; Sesame Link moves terminal sessions out.
 
@@ -12,6 +16,7 @@ Voice Capture moves audio in; Sesame Link moves terminal sessions out.
 - [What it does](#what-it-does)
 - [Install and sign-in](#install-and-sign-in)
 - [Architecture](#architecture)
+- [The Devin bridge (Pi slot)](#the-devin-bridge-pi-slot)
 - [TLS inspection (the one real gotcha)](#tls-inspection-the-one-real-gotcha)
 - [Security posture](#security-posture)
 - [Command reference](#command-reference)
@@ -26,6 +31,8 @@ Voice Capture moves audio in; Sesame Link moves terminal sessions out.
   phone or laptop can start, watch, and steer them.
 - Sessions survive disconnects (tmux underneath); you can attach locally with
   `sesame-link sessions` or remotely from the web app.
+- The "Pi" runtime slot is occupied by a bridge that runs Devin Local, so a
+  Pi session started on the phone drives Devin on this Mac.
 - Sessions link their work to GitHub PRs through the local `gh` CLI when
   `pull-requests` is enabled.
 
@@ -53,6 +60,9 @@ daemon.lock                     lifecycle lock
 machine/credential              machine credential used for the gateway channel
 api.sock, api-token             local IPC socket + token for CLI <-> daemon
 sessions/, ended-sessions/      live and ended session records
+pi/                             per-session control sockets for Pi sessions
+sessions/<id>/                  per-session adapter dir (extension, mcp.json,
+                                guidance, attempt journal, history)
 idempotency/                    dedupe keys for remote requests
 daemon-intent.json              desired running/stopped state
 daemon-launch.json              options the daemon was started with
@@ -62,6 +72,7 @@ daemon-service-ready            readiness marker
 management-environment          resolved service environment
 recent-working-directories.json recent session working dirs
 session-host.command            helper for session hosting
+pi-invocations.log              diagnostic: every `pi` spawn (written by the shim)
 ```
 
 ## Architecture
@@ -95,7 +106,7 @@ sesame-link daemon (Rust, launchd, ~/.local/bin/sesame-link)
    |-- state: ~/.local/state/sesame-link/ (0700)
    |        auth/production.json  machine/credential  remote-access.json
    |-- spawns / attaches tmux -> runtime sessions
-   |        claude (Claude Code)  codex  pi  cursor
+   |        claude (Claude Code)  codex  pi (bridge -> devin)  cursor
    +-- local tools: gh CLI -> GitHub PRs; runtime executables on PATH
 ```
 
@@ -106,7 +117,8 @@ runtime, and tmux versions.
 
 ```
 REMOTE PATH   phone/browser -> session service -> gateway ws -> daemon
-              -> tmux -> runtime        (keystrokes in, terminal out)
+              -> tmux -> runtime adapter -> agent
+              (Claude: hooks + terminal relay; Pi: extension protocol)
 
 LOCAL PATH    terminal -> `sesame-link claude` or `sessions` -> tmux attach
               (bypasses the cloud entirely)
@@ -128,6 +140,78 @@ PR PATH       session work -> local `gh` -> GitHub PRs surfaced in web app
 | revocation         | `sesame-link unpair`; sign-in expires in 30 days              |
 | TLS inspection     | embedded webpki roots; needs Do-Not-Inspect rules (see below) |
 
+## The Devin bridge (Pi slot)
+
+Sesame Link's runtime list is fixed (`claude`, `codex`, `pi`, `cursor`); there
+is no Devin option and no custom-runtime registration. Its Pi integration is
+also deeper than the terminal relay used for Claude: at session start the
+daemon extracts an embedded `extension.ts`/`adapter.mjs`/`transport.mjs`/
+`ledger.mjs` into the session dir and launches
+
+```
+pi --offline --append-system-prompt <remote-guidance.txt> -e <extension.ts> --session-dir <dir>/history
+```
+
+with `SESAME_PI_ADAPTER_DIR` and `SESAME_PI_CONTROL_SOCKET` set. Inside real
+Pi the extension opens a unix socket and serves a JSON-lines RPC the daemon
+uses for everything: `startup`, `state`, `models`, `events`, `history`,
+`submit`, `abort`, `configure`, `rename`, `compact`, `reload`. A plain
+`pi -> devin` exec shim passes the `pi --version` probe but can never answer
+that socket, so sessions fail with `503 dependency_unavailable`.
+
+The bridge in `bridge/devin-pi-bridge.mjs` _is_ that endpoint:
+
+```
+~/.local/bin/pi (shim)
+   |-- --version            -> devin version   (daemon's readiness probe)
+   |-- SESAME_PI_ADAPTER_DIR or `-e` arg
+   |                        -> node bridge/devin-pi-bridge.mjs
+   `-- otherwise            -> exec devin
+
+bridge serves control.sock
+   |-- startup/state/models/events/history/deliveries/operation
+   |-- submit -> devin acp: initialize -> authenticate -> session/new -> session/prompt
+   |-- abort -> session/cancel
+   +-- events back to the daemon: command_*, input, message_*, agent_*, tool_*
+```
+
+- Auth: `authenticate` with `meta.api_key` read at runtime from
+  `~/.local/share/devin/credentials.toml`. The key is never logged and never
+  stored by the bridge.
+- Spawned lazily: `devin acp` only boots on the first `submit`, so catalog
+  probes and idle sessions cost nothing. First submit is slow while devin's
+  configured MCP servers boot.
+- The daemon's `remote-guidance.txt` is injected once into the first prompt
+  (embedded resource block), and its `mcp.json` server spec is forwarded to
+  `session/new` (falls back to none if the ACP server rejects the spec).
+- `BRIDGE_PERMISSION_PICK` controls how `session/request_permission` is
+  auto-answered; default `allow_once`. There is no one at the terminal, so
+  every tool call is approved on that rule.
+- `DEVIN_BIN` overrides the devin executable path.
+- Every `pi` invocation is logged to `pi-invocations.log` (args + SESAME\_\*
+  env) for diagnostics; safe to delete anytime.
+
+Known gaps and approximations:
+
+- `steer` is approximated as cancel-then-new-prompt; it is not in-turn
+  injection.
+- `durableHistory` is claimed, but history is held in memory; a bridge
+  respawn starts the visible history over (the devin session itself keeps
+  its context).
+- The Pi model catalog probe does not invoke `pi` at all, so the app shows
+  models as a free-text field; `configure` accepts any name and forwards it
+  best-effort.
+- If real Pi is ever installed, `~/.local/bin/pi` shadows it: remove the shim
+  first.
+- The shim pins node to the mise `24.19.0` path; update it on Node upgrades.
+- `compact`/`reload` report success without touching devin's context.
+
+Rollback:
+
+```bash
+rm ~/.local/bin/pi && sesame-link restart
+```
+
 ## TLS inspection (the one real gotcha)
 
 `sesame-link` is a Rust binary built on `hyper-rustls` with `webpki-roots`: a
@@ -135,7 +219,7 @@ fixed Mozilla CA bundle compiled in. It does **not** read the OS trust store,
 and rustls ignores `SSL_CERT_FILE`. On any network doing TLS interception
 (Cloudflare Gateway/WARP, Zscaler, Netskope), every HTTPS call fails
 certificate validation and the CLI reports a misleading
-"couldn't reach Sesame" — the service is fine, the binary just can't verify
+"couldn't reach Sesame": the service is fine, the binary just can't verify
 the inspected chain.
 
 Diagnosis recipe:
@@ -146,12 +230,12 @@ curl -Iv https://sesame-link-session-service.fly.dev
 # TLS inspection is active on this network.
 ```
 
-Client-side there is no fix — the root store is baked into the binary. The
+Client-side there is no fix: the root store is baked into the binary. The
 durable fix is a **Do Not Inspect** policy at the proxy for:
 
-- `sesame-link-session-service.fly.dev` — auth API and the persistent
+- `sesame-link-session-service.fly.dev`: auth API and the persistent
   `wss://` gateway channel (needed continuously, not just at login)
-- `storage.googleapis.com` — release downloads and `sesame-link update`
+- `storage.googleapis.com`: release downloads and `sesame-link update`
 
 On Cloudflare Zero Trust that is a Gateway HTTP rule with action
 `off`/`Do Not Inspect` and a `http.conn.hostname` selector, placed ahead of
@@ -189,12 +273,23 @@ Runtime toggles via `sesame-link config <setting> on|off`:
 `claude-mod`, `error-reporting`, `remote-update`, `thinking`,
 `pull-requests`.
 
+Bridge-specific posture:
+
+- `allow_remote_bash_commands` gates sesame-link's own remote bash tool, not
+  Devin's tools. In a Pi (bridge) session, Devin decides what it runs, and
+  `session/request_permission` is auto-answered per `BRIDGE_PERMISSION_PICK`
+  (default `allow_once`). Treat any Pi session as shell access on this Mac.
+- Devin bills usage to the signed-in account, unlike the Claude subscription
+  path.
+
 Hardening suggestions:
 
 - Drop `dontAsk` (and `auto`, if unused) from `allowed_permission_modes` for
   unattended sessions; `manual`/`plan`/`acceptEdits` keeps remote approval in
   the loop.
 - Keep `allow_remote_bash_commands` off; it is the highest-blast-radius switch.
+- Consider `BRIDGE_PERMISSION_PICK=reject_once` if a Pi session should only
+  answer questions, or run bridge sessions in a throwaway folder.
 - The sign-in is valid 30 days and the machine credential rotates
   independently; `sesame-link unpair` revokes the machine entirely.
 - The state directory is owner-only (`0700`); keep it that way.
@@ -226,32 +321,42 @@ Hardening suggestions:
 
 - **Continue desk work from the phone:** run `/open-sesame` inside a local
   Claude Code session, then open the web app anywhere.
+- **Drive Devin from the phone:** start a **Pi** session in the web app; the
+  bridge runs Devin underneath, and `sesame-link status` shows
+  `Pi + ready  devin <version>`.
 - **Kick off remote work:** in the web app, start a session and give an
   absolute path on this machine (e.g. `~/projects/<repo>`) as the working
   directory.
 - **Attach locally:** `sesame-link sessions` shows a picker; sessions are tmux
-  under the hood.
+  under the hood. The bridge pane shows only status lines; the real exchange
+  is in the app.
 - **Watch a session's PRs:** with `pull-requests` on, sessions surface the
   PRs they open or push to, resolved through the local `gh`.
 
 ## Troubleshooting
 
-| Symptom                                   | Likely cause                                              | Fix                                                                          |
-| ----------------------------------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| "Couldn't reach Sesame" on `auth login`   | TLS inspection vs embedded webpki roots                   | Do-Not-Inspect rule (see above); verify issuer with `openssl s_client`       |
-| `status` says "running but not answering" | stale daemon                                              | `sesame-link restart`; check `logs`                                          |
-| "tmux isn't installed"                    | daemon started with a different PATH than the login shell | install tmux, then `sesame-link restart` so the tmux server re-inherits PATH |
-| Runtime shows `unavailable`               | missing executable                                        | install `claude`/`codex`/etc., or pass an explicit executable flag           |
-| Login lock errors                         | stale `auth/login.lock`                                   | remove the lock file and retry                                               |
-| Web app can't see sessions                | remote access off or machine revoked                      | `remote-access.json` -> `remote_access_enabled`, else `auth login` again     |
+| Symptom                                                | Likely cause                                              | Fix                                                                          |
+| ------------------------------------------------------ | --------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| "Couldn't reach Sesame" on `auth login`                | TLS inspection vs embedded webpki roots                   | Do-Not-Inspect rule (see above); verify issuer with `openssl s_client`       |
+| `status` says "running but not answering"              | stale daemon                                              | `sesame-link restart`; check `logs`                                          |
+| "tmux isn't installed"                                 | daemon started with a different PATH than the login shell | install tmux, then `sesame-link restart` so the tmux server re-inherits PATH |
+| Runtime shows `unavailable`                            | missing executable                                        | install `claude`/`codex`/etc., or pass an explicit executable flag           |
+| Pi session: `503 / dependency_unavailable`             | `pi` is not serving the control socket (old exec shim)    | use the bridge shim; check the session pane and `pi-invocations.log`         |
+| Pi session: submits fail with `command_failed`         | `devin acp` boot or auth failed                           | `devin auth login` locally; check pane `[bridge]` lines in the tmux session  |
+| "Pi's model catalog is unavailable" in `daemon.log`    | catalog probe doesn't call `pi`                           | cosmetic: models stay free-text; sessions still work                         |
+| Bridge pane shows nothing after a submit               | `devin acp` still booting MCP servers                     | first submit takes ~a minute; later ones are fast                            |
+| `pi` runs devin instead of real Pi outside sesame-link | shim fallthrough                                          | intended: `pi` outside Link spawns `devin`; delete shim to restore real Pi   |
+| Login lock errors                                      | stale `auth/login.lock`                                   | remove the lock file and retry                                               |
+| Web app can't see sessions                             | remote access off or machine revoked                      | `remote-access.json` -> `remote_access_enabled`, else `auth login` again     |
 
 `sesame-link diagnostics` produces the bundle to send when asking for help.
 
 ## Next steps
 
-1. Run `sesame-link install-claude-command` so `/open-sesame` is available.
-2. Tighten `allowed_permission_modes` in `remote-access.json` before
+1. Tighten `allowed_permission_modes` in `remote-access.json` before
    unattended use (drop `dontAsk`/`auto`).
+2. Decide on `BRIDGE_PERMISSION_PICK` for Pi sessions (`allow_once` vs a
+   throwaway workspace) and record the choice.
 3. Add a second runtime (e.g. Codex) if multi-agent sessions are wanted.
 4. Report the missing native-roots issue upstream; note the Do-Not-Inspect
    rule in the org's infra docs so it survives policy changes.
@@ -262,6 +367,6 @@ Hardening suggestions:
 
 This file is safe to publish: it contains no account IDs, machine IDs,
 sign-in tokens, credentials, or user paths. Do not paste the contents of
-`auth/production.json`, `machine/credential`, or `remote-access.json`
-verbatim into public docs — the first two are live secrets and the third
-contains a machine identifier.
+`auth/production.json`, `machine/credential`, `remote-access.json`, or
+per-session `mcp-capability` files verbatim into public docs; the first two
+are live secrets and the others contain machine or capability identifiers.
