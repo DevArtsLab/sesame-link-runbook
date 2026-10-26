@@ -12,12 +12,17 @@
 
 import net from "node:net";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 
-const DEVIN = process.env.DEVIN_BIN || "/Users/ao/.local/bin/devin";
-const CREDENTIALS = "/Users/ao/.local/share/devin/credentials.toml";
+const HOME = process.env.HOME || os.homedir();
+const DEVIN =
+  process.env.DEVIN_BIN || path.join(HOME, ".local", "bin", "devin");
+const CREDENTIALS =
+  process.env.DEVIN_CREDENTIALS ||
+  path.join(HOME, ".local", "share", "devin", "credentials.toml");
 const FRAME_BYTES = 1024 * 1024;
 const TOKEN = /^[a-zA-Z0-9_-]{1,100}$/;
 const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);

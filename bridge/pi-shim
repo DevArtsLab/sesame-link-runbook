@@ -1,0 +1,36 @@
+#!/bin/sh
+# Sesame Link "Pi" runtime -> Devin bridge.
+# Install: copy to ~/.local/bin/pi (or anywhere ahead of a real `pi` on PATH)
+# and set BRIDGE_SCRIPT below or export it in the daemon environment.
+#
+# --version answers the daemon's probe. When Sesame Link launches a session
+# or catalog probe (`pi ... -e <extension>` with SESAME_PI_ADAPTER_DIR set),
+# run the bridge that serves the Link control-socket protocol over devin acp.
+# Any other use of `pi` falls through to the real Devin CLI.
+
+DEVIN_BIN="${DEVIN_BIN:-$HOME/.local/bin/devin}"
+# The daemon's PATH is minimal (/usr/bin:/bin:...); find node where it lives.
+if [ -n "$NODE_BIN" ]; then :; elif command -v node >/dev/null 2>&1; then
+  NODE_BIN="$(command -v node)"
+elif [ -x "$HOME/.local/share/mise/shims/node" ]; then
+  NODE_BIN="$HOME/.local/share/mise/shims/node"
+else
+  NODE_BIN="$(ls -d "$HOME"/.local/share/mise/installs/node/*/bin/node 2>/dev/null | sort -V | tail -1)"
+fi
+BRIDGE_SCRIPT="${BRIDGE_SCRIPT:-$HOME/projects/devartslab/sesame-link-runbook/bridge/devin-pi-bridge.mjs}"
+
+case "$1" in
+  --version|-V|version) "$DEVIN_BIN" version 2>/dev/null | head -1 || echo "pi 0.0.0";;
+  *)
+    {
+      date -u '+%Y-%m-%dT%H:%M:%SZ'
+      echo "  args: $*"
+      env | grep '^SESAME_' | sed 's/^/  /'
+    } >> "$HOME/.local/state/sesame-link/pi-invocations.log" 2>/dev/null
+    case " $* " in *" -e "*) link=1;; esac
+    if [ -n "$SESAME_PI_ADAPTER_DIR" ] || [ -n "$link" ]; then
+      exec "$NODE_BIN" "$BRIDGE_SCRIPT" "$@"
+    fi
+    exec "$DEVIN_BIN" "$@"
+    ;;
+esac

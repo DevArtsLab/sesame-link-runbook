@@ -159,10 +159,17 @@ uses for everything: `startup`, `state`, `models`, `events`, `history`,
 `pi -> devin` exec shim passes the `pi --version` probe but can never answer
 that socket, so sessions fail with `503 dependency_unavailable`.
 
-The bridge in `bridge/devin-pi-bridge.mjs` _is_ that endpoint:
+The bridge in `bridge/devin-pi-bridge.mjs` _is_ that endpoint. Install the
+shim from this repo:
+
+```bash
+cp bridge/pi-shim ~/.local/bin/pi && chmod +x ~/.local/bin/pi
+# edit BRIDGE_SCRIPT in the shim if the repo lives somewhere else
+sesame-link restart
+```
 
 ```
-~/.local/bin/pi (shim)
+~/.local/bin/pi (shim: bridge/pi-shim)
    |-- --version            -> devin version   (daemon's readiness probe)
    |-- SESAME_PI_ADAPTER_DIR or `-e` arg
    |                        -> node bridge/devin-pi-bridge.mjs
@@ -187,7 +194,12 @@ bridge serves control.sock
 - `BRIDGE_PERMISSION_PICK` controls how `session/request_permission` is
   auto-answered; default `allow_once`. There is no one at the terminal, so
   every tool call is approved on that rule.
-- `DEVIN_BIN` overrides the devin executable path.
+- `DEVIN_BIN` overrides the devin executable path (default
+  `~/.local/bin/devin`); `DEVIN_CREDENTIALS` overrides the credentials file
+  (default `~/.local/share/devin/credentials.toml`); `BRIDGE_PERMISSION_PICK`
+  is described below. In the shim, `NODE_BIN` overrides the node executable
+  (default: first `node` on PATH) and `BRIDGE_SCRIPT` points at the bridge
+  file (edit it to your clone path if you moved the repo).
 - Every `pi` invocation is logged to `pi-invocations.log` (args + SESAME\_\*
   env) for diagnostics; safe to delete anytime.
 
@@ -203,7 +215,8 @@ Known gaps and approximations:
   best-effort.
 - If real Pi is ever installed, `~/.local/bin/pi` shadows it: remove the shim
   first.
-- The shim pins node to the mise `24.19.0` path; update it on Node upgrades.
+- The shim resolves `node` from PATH; set `NODE_BIN` if the daemon's PATH
+  cannot find it.
 - `compact`/`reload` report success without touching devin's context.
 
 Rollback:
