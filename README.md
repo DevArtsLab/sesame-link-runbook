@@ -8,6 +8,19 @@ This repo also hosts `bridge/devin-pi-bridge.mjs`: the adapter that puts
 Devin Local behind Sesame Link's "Pi" runtime slot. See
 [The Devin bridge](#the-devin-bridge-pi-slot).
 
+End to end, a Pi session on this machine looks like:
+
+```
+remote client (link.sesame.com / voice)
+  -> sesame-link daemon (127.0.0.1:3210)
+    -> tmux server "sesame-link" (started by session-host.command)
+      -> spawns: pi --offline --append-system-prompt <guidance> -e <ext> --session-dir <dir>
+        -> ~/.local/bin/pi  (shim, source: bridge/pi-shim)
+          -> execs node bridge/devin-pi-bridge.mjs
+            -> serves Link control-socket RPC on pi/<session>.sock
+            -> drives `devin acp` over stdio JSON-RPC
+```
+
 This is unrelated to Sesame Voice Capture (see `../sesame-voice-escort`).
 Voice Capture moves audio in; Sesame Link moves terminal sessions out.
 
