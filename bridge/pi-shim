@@ -18,6 +18,10 @@ else
   NODE_BIN="$(ls -d "$HOME"/.local/share/mise/installs/node/*/bin/node 2>/dev/null | sort -V | tail -1)"
 fi
 BRIDGE_SCRIPT="${BRIDGE_SCRIPT:-$HOME/projects/devartslab/sesame-link-runbook/bridge/devin-pi-bridge.mjs}"
+# Auto-answer session/request_permission. allow_once = sessions may run
+# tools; reject_once = read-only, every tool call is denied. Unset env falls
+# back to the bridge's built-in default (allow_once).
+export BRIDGE_PERMISSION_PICK="${BRIDGE_PERMISSION_PICK:-allow_once}"
 
 case "$1" in
   --version|-V|version) "$DEVIN_BIN" version 2>/dev/null | head -1 || echo "pi 0.0.0";;
@@ -27,7 +31,7 @@ case "$1" in
       echo "  args: $*"
       env | grep '^SESAME_' | sed 's/^/  /'
     } >> "$HOME/.local/state/sesame-link/pi-invocations.log" 2>/dev/null
-    case " $* " in *" -e "*) link=1;; esac
+    case " $* " in *" -e "*|*" --mode "*) link=1;; esac
     if [ -n "$SESAME_PI_ADAPTER_DIR" ] || [ -n "$link" ]; then
       exec "$NODE_BIN" "$BRIDGE_SCRIPT" "$@"
     fi

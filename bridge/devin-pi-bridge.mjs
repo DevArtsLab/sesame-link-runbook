@@ -11,6 +11,7 @@
 //   events    { type:'event', epoch, seq, sessionId, data }
 
 import net from "node:net";
+import readline from "node:readline";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,8 +19,7 @@ import { spawn } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 
 const HOME = process.env.HOME || os.homedir();
-const DEVIN =
-  process.env.DEVIN_BIN || path.join(HOME, ".local", "bin", "devin");
+const DEVIN = process.env.DEVIN_BIN || path.join(HOME, ".local", "bin", "devin");
 const CREDENTIALS =
   process.env.DEVIN_CREDENTIALS ||
   path.join(HOME, ".local", "share", "devin", "credentials.toml");
@@ -47,6 +47,34 @@ const MODELS = [
 // is watching a terminal. 'allow_once' grants each tool call individually.
 const PERMISSION_PICK = process.env.BRIDGE_PERMISSION_PICK || "allow_once";
 
+// Catalog probe: the daemon asks `pi --mode rpc --no-session --offline` for
+// the models catalog over stdio JSON-lines - no control socket, no session,
+// no adapter dir. Answer and exit before any adapter state is touched.
+if (process.argv.includes("--no-session")) {
+  const rl = readline.createInterface({ input: process.stdin });
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let request;
+    try {
+      request = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const respond = (body) =>
+      process.stdout.write(
+        JSON.stringify({ type: "response", id: request?.id, ...body }) + "\n",
+      );
+    if (request?.type === "models") respond({ ok: true, result: MODELS });
+    else
+      respond({
+        ok: false,
+        error: "no-session mode serves only the models catalog",
+        dispatch: "not_attempted",
+      });
+  }
+  process.exit(0);
+}
+
 const adapterDir = process.env.SESAME_PI_ADAPTER_DIR;
 if (!adapterDir) {
   console.error(
@@ -69,6 +97,7 @@ if (sessionDir) {
     fs.mkdirSync(sessionDir, { recursive: true });
   } catch {}
 }
+
 const sessionFile = path.join(sessionDir || adapterDir, "devin-session.jsonl");
 const stateFile = path.join(sessionDir || adapterDir, "devin-session-state.json");
 const ledgerFile = path.join(adapterDir, "attempts.jsonl");
