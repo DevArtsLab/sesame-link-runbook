@@ -8,6 +8,23 @@ This repo also hosts `bridge/devin-pi-bridge.mjs`: the adapter that puts
 Devin Local behind Sesame Link's "Pi" runtime slot. See
 [The Devin bridge](#the-devin-bridge-pi-slot).
 
+## Contents
+
+- [End to end flow](#end-to-end-flow)
+- [What it does](#what-it-does)
+- [Diagram](#diagram)
+- [Install and sign-in](#install-and-sign-in)
+- [Architecture](#architecture)
+- [The Devin bridge (Pi slot)](#the-devin-bridge-pi-slot)
+- [TLS inspection (the one real gotcha)](#tls-inspection-the-one-real-gotcha)
+- [Security posture](#security-posture)
+- [Command reference](#command-reference)
+- [Daily workflows](#daily-workflows)
+- [Troubleshooting](#troubleshooting)
+- [Next steps](#next-steps)
+
+## End to end flow
+
 End to end, a Pi session on this machine looks like:
 
 ```
@@ -24,19 +41,6 @@ remote client (link.sesame.com / voice)
 This is unrelated to Sesame Voice Capture (see `../sesame-voice-escort`).
 Voice Capture moves audio in; Sesame Link moves terminal sessions out.
 
-## Contents
-
-- [What it does](#what-it-does)
-- [Install and sign-in](#install-and-sign-in)
-- [Architecture](#architecture)
-- [The Devin bridge (Pi slot)](#the-devin-bridge-pi-slot)
-- [TLS inspection (the one real gotcha)](#tls-inspection-the-one-real-gotcha)
-- [Security posture](#security-posture)
-- [Command reference](#command-reference)
-- [Daily workflows](#daily-workflows)
-- [Troubleshooting](#troubleshooting)
-- [Next steps](#next-steps)
-
 ## What it does
 
 - Runs agent runtimes (Claude Code, Codex, Pi, Cursor) in tmux on this machine.
@@ -48,6 +52,10 @@ Voice Capture moves audio in; Sesame Link moves terminal sessions out.
   Pi session started on the phone drives Devin on this Mac.
 - Sessions link their work to GitHub PRs through the local `gh` CLI when
   `pull-requests` is enabled.
+
+## Diagram
+
+![diagram.png](diagram.png)
 
 ## Install and sign-in
 
